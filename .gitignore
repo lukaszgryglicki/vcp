@@ -1,0 +1,4 @@
+/target
+copilot-session-*.md
+*.secret
+*.swp
