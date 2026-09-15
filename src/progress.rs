@@ -6,12 +6,18 @@
 //! output goes to stderr and is automatically disabled when stderr is
 //! not a tty.
 //!
-//! Single object copied: one full-width bar:
+//! Single object copied: one full-width bar plus the speed line:
 //!   |=============== (filename   34.01%) ===>          |
-//! More than one object: three labeled bars:
+//!   | speed: current    4.213 M/s    average    3.987 M/s          |
+//! More than one object: three labeled bars plus the speed line:
 //!   count: |===== ( 12/345    3.48%) =>                |
 //!   bytes: |===== ( 259.31M/2.03T   12.34%) ==>        |
 //!   file:  |===== (...current/file.c   45.00%) ====>   |
+//!   speed: | current    4.213 M/s    average    3.987 M/s        |
+//!
+//! `current` is the transfer rate over the last few seconds
+//! (SPEED_WINDOW), `average` the rate since copying started; both are
+//! fixed-width fields so nothing moves while the numbers change.
 //!
 //! The `(...)` status text in the middle is not part of the gauge: the
 //! fill track is the cells left of `(` plus the cells right of `)`, so
@@ -28,12 +34,15 @@
 //! position slides back and forth over time ("long...name", "lon...ame",
 //! ...), so the whole name can be read over a few redraws.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 const THROTTLE: Duration = Duration::from_millis(50);
 /// Sliding-ellipsis animation advances one position per this many ms.
 const ANIM_MS: u128 = 100;
+/// "current" speed is measured over (at least) this much recent history.
+const SPEED_WINDOW: Duration = Duration::from_secs(3);
 /// Minimum sensible bar width; narrower `COLUMNS`/terminal values are
 /// bumped up to this, and it doubles as the fallback when the width
 /// cannot be determined at all.
@@ -53,6 +62,14 @@ pub struct Progress {
     started: bool,
     last: Instant,
     anim0: Instant,
+    /// Bytes actually transferred (unlike done_bytes, which also
+    /// accounts for skipped/failed files to keep the bars honest).
+    xfer: u64,
+    /// When copying started; the base of the average speed.
+    t0: Instant,
+    /// (time, xfer) samples covering at least SPEED_WINDOW; the front
+    /// one is the reference point for the current speed.
+    samples: VecDeque<(Instant, u64)>,
 }
 
 fn term_width() -> usize {
@@ -111,6 +128,35 @@ fn bytes_info(done: u64, total: u64) -> String {
 /// `done/total` for the count bar, `done` padded to a constant width.
 fn count_info(done: u64, total: u64) -> String {
     format!("{:>w$}/{}", done, total, w = total.to_string().len())
+}
+
+/// Fixed-width (12 chars) transfer rate: `   4.213 M/s`, `1023.999 K/s`.
+fn speed_str(bps: f64) -> String {
+    const UNITS: [&str; 7] = ["B", "K", "M", "G", "T", "P", "E"];
+    let mut v = if bps.is_finite() && bps > 0.0 { bps } else { 0.0 };
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{:>8.3} {}/s", v, UNITS[i])
+}
+
+/// Render the speed status line, boxed like the bars and `width - 1`
+/// columns wide: `speed: | current    4.213 M/s    average    3.987 M/s |`.
+/// With an empty label (single-object mode) the word moves inside.
+fn speed_line(label: &str, cur: f64, avg: f64, width: usize) -> String {
+    let inner = width.saturating_sub(label.len() + 3).max(13);
+    let txt = format!(
+        "{} current {}    average {}",
+        if label.is_empty() { " speed:" } else { "" },
+        speed_str(cur),
+        speed_str(avg)
+    );
+    let mut cells = txt.into_bytes();
+    cells.truncate(inner);
+    cells.resize(inner, b' ');
+    format!("{}|{}|", label, String::from_utf8_lossy(&cells))
 }
 
 /// Shorten a long name to `max` chars with an ASCII "..." replacing a
@@ -204,12 +250,19 @@ impl Progress {
             started: false,
             last: Instant::now(),
             anim0: Instant::now(),
+            xfer: 0,
+            t0: Instant::now(),
+            samples: VecDeque::new(),
         }
     }
 
     pub fn start(&mut self) {
         if self.enabled {
             self.started = true;
+            let t0 = Instant::now();
+            self.t0 = t0;
+            self.samples.clear();
+            self.record(t0);
             self.draw(true);
         }
     }
@@ -224,6 +277,7 @@ impl Progress {
     pub fn add(&mut self, n: u64) {
         self.cur_done += n;
         self.done_bytes += n;
+        self.xfer += n;
         self.draw(false);
     }
 
@@ -277,6 +331,35 @@ impl Progress {
         }
     }
 
+    /// Take a speed sample at `now`, dropping history older than the
+    /// window while keeping the last sample before its boundary so the
+    /// front always spans at least SPEED_WINDOW (once that much has
+    /// elapsed).
+    fn record(&mut self, now: Instant) {
+        self.samples.push_back((now, self.xfer));
+        while self.samples.len() >= 2 && now.duration_since(self.samples[1].0) >= SPEED_WINDOW {
+            self.samples.pop_front();
+        }
+    }
+
+    /// (current, average) transfer rates in bytes/second at `now`.
+    fn speeds(&self, now: Instant) -> (f64, f64) {
+        let el = now.duration_since(self.t0).as_secs_f64();
+        let avg = if el > 0.0 { self.xfer as f64 / el } else { 0.0 };
+        let cur = match self.samples.front() {
+            Some(&(t, b)) => {
+                let dt = now.duration_since(t).as_secs_f64();
+                if dt > 0.0 {
+                    self.xfer.saturating_sub(b) as f64 / dt
+                } else {
+                    avg
+                }
+            }
+            None => avg,
+        };
+        (cur, avg)
+    }
+
     fn draw(&mut self, force: bool) {
         if !self.enabled || !self.started {
             return;
@@ -284,7 +367,10 @@ impl Progress {
         if !force && self.drawn > 0 && self.last.elapsed() < THROTTLE {
             return;
         }
-        self.last = Instant::now();
+        let now = Instant::now();
+        self.last = now;
+        self.record(now);
+        let (cur, avg) = self.speeds(now);
         let w = term_width();
         let tick = (self.anim0.elapsed().as_millis() / ANIM_MS) as usize;
         let name = self.cur_name.clone();
@@ -305,8 +391,10 @@ impl Progress {
                 tick,
             ));
             lines.push(bar("file:  ", &name, self.pct_cur(), w, tick));
+            lines.push(speed_line("speed: ", cur, avg, w));
         } else {
             lines.push(bar("", &name, self.pct_bytes(), w, tick));
+            lines.push(speed_line("", cur, avg, w));
         }
         let mut out = String::new();
         if self.drawn > 0 {
@@ -410,7 +498,11 @@ impl Progress {
 
 #[cfg(test)]
 mod tests {
-    use super::{bar, bytes_info, count_info, humanize, slide_trunc, term_width};
+    use super::{
+        bar, bytes_info, count_info, humanize, slide_trunc, speed_line, speed_str, term_width,
+        Progress,
+    };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn short_names_untouched() {
@@ -666,5 +758,104 @@ mod tests {
         // no tty in the test harness -> MIN_WIDTH fallback; with a tty
         // the ioctl result is clamped to >= 80 as well
         assert!(term_width() >= 80);
+    }
+
+    const MB: f64 = 1048576.0;
+
+    #[test]
+    fn speed_str_fixed_width() {
+        assert_eq!(speed_str(0.0), "   0.000 B/s");
+        assert_eq!(speed_str(999.5), " 999.500 B/s");
+        assert_eq!(speed_str(1023.999 * 1024.0), "1023.999 K/s");
+        assert_eq!(speed_str(4.213 * MB), "   4.213 M/s");
+        assert_eq!(speed_str(3.5 * 1024.0 * MB), "   3.500 G/s");
+        assert_eq!(speed_str(f64::NAN), "   0.000 B/s");
+        assert_eq!(speed_str(-5.0), "   0.000 B/s");
+        for v in [0.0, 1.0, 1023.0, 1024.0, 12345.678, 4.2 * MB, 1e12, 1e15] {
+            assert_eq!(speed_str(v).len(), 12, "{}", v);
+        }
+    }
+
+    #[test]
+    fn speed_line_layout() {
+        for width in [80, 100, 132] {
+            let l = speed_line("speed: ", 4.213 * MB, 3.987 * MB, width);
+            assert_eq!(l.chars().count(), width - 1);
+            assert!(
+                l.starts_with("speed: | current    4.213 M/s    average    3.987 M/s "),
+                "{:?}",
+                l
+            );
+            assert!(l.ends_with('|'));
+            let s = speed_line("", 4.213 * MB, 3.987 * MB, width);
+            assert_eq!(s.chars().count(), width - 1);
+            assert!(
+                s.starts_with("| speed: current    4.213 M/s    average    3.987 M/s "),
+                "{:?}",
+                s
+            );
+            assert!(s.ends_with('|'));
+        }
+        // words, both "/s" and the closing '|' never move as values change
+        let vals = [0.0, 1.5, 999.0 * 1024.0, 4.2 * MB, 3.5 * 1024.0 * MB, 7.0e12];
+        for label in ["speed: ", ""] {
+            let key = |l: &str| {
+                (
+                    l.find("current").unwrap(),
+                    l.find("average").unwrap(),
+                    l.find("/s").unwrap(),
+                    l.rfind("/s").unwrap(),
+                    l.rfind('|').unwrap(),
+                )
+            };
+            let first = key(&speed_line(label, vals[0], vals[0], 80));
+            for &c in &vals {
+                for &a in &vals {
+                    assert_eq!(key(&speed_line(label, c, a, 80)), first);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn speeds_window_and_average() {
+        let mb = 1u64 << 20;
+        let t0 = Instant::now();
+        let mut p = Progress::new(2, 0);
+        p.t0 = t0;
+        p.samples.clear();
+        p.record(t0);
+        let (cur, avg) = p.speeds(t0);
+        assert_eq!((cur, avg), (0.0, 0.0));
+
+        // 10 s at 10 MB/s (1 MB every 100 ms)
+        let mut t = t0;
+        for _ in 0..100 {
+            t += Duration::from_millis(100);
+            p.add(mb);
+            p.record(t);
+        }
+        let (cur, avg) = p.speeds(t);
+        assert!((avg - 10.0 * MB).abs() < 0.01 * MB, "avg {}", avg);
+        assert!((cur - 10.0 * MB).abs() < 0.01 * MB, "cur {}", cur);
+        // history is bounded: ~window/sample-interval entries
+        assert!(p.samples.len() <= 32, "{}", p.samples.len());
+
+        // then 5 s at 1 MB/s: average blends, current follows the window
+        for _ in 0..50 {
+            t += Duration::from_millis(100);
+            p.add(mb / 10);
+            p.record(t);
+        }
+        let (cur, avg) = p.speeds(t);
+        assert!((avg - 7.0 * MB).abs() < 0.01 * MB, "avg {}", avg); // 105 MB / 15 s
+        assert!((cur - 1.0 * MB).abs() < 0.01 * MB, "cur {}", cur);
+
+        // stall for a full window: current drops to 0, average decays
+        let t2 = t + Duration::from_secs(3);
+        p.record(t2);
+        let (cur, avg) = p.speeds(t2);
+        assert_eq!(cur, 0.0);
+        assert!((avg - 105.0 * MB / 18.0).abs() < 0.01 * MB, "avg {}", avg);
     }
 }

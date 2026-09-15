@@ -10,20 +10,28 @@ Progress is drawn on **stderr**, only when stderr is a terminal, and never
 interferes with `-v` output, prompts or warnings (bars are cleared, the
 message is printed, bars are redrawn).
 
-Copying a single file — one full-width bar:
+Copying a single file — one full-width bar plus the speed line:
 
 ```
 |=================== (bigfile.iso    34.01%) =====>                            |
+| speed: current    4.213 M/s    average    3.987 M/s                          |
 ```
 
 Copying multiple files/directories — three labeled bars (overall count,
-overall bytes, current file):
+overall bytes, current file) plus the speed line:
 
 ```
 count: |=========== ( 12/345     3.48%) =>                                    |
 bytes: |======== ( 259.31M/2.03T    12.34%) ==>                               |
 file:  |========== (...ath/to/current/file.c    45.00%) ====>                 |
+speed: | current    4.213 M/s    average    3.987 M/s                         |
 ```
+
+The speed line is always present: *current* is the transfer rate over the
+last 3 seconds, *average* the rate since copying started. Both are
+fixed-width fields (`XXXX.XXX U/s`, unit auto-scaled B/K/M/G/T), so the
+words and the `/s` never move. Only bytes actually transferred count
+(skipped or failed files do not inflate the speed).
 
 The `(...)` status text in the middle is **not** part of the gauge: the
 fill track is the cells left of `(` plus the cells right of `)`. Reaching
@@ -95,8 +103,11 @@ writes outside of it (refused with `Permission denied`). File flags
 (`chflags`) and NFSv4/POSIX.1e ACL preservation with `-p` are FreeBSD-only;
 on Linux those steps (and `RESOLVE_BENEATH`) are skipped.
 
-Copying uses `copy_file_range(2)` with a read/write fallback, in chunks, so
-progress stays smooth.
+Copying uses `copy_file_range(2)` with a read/write fallback. Request sizes
+adapt to the observed throughput (64K–4M: doubling while requests complete
+quickly, halving when they drag), so the bars and the speed readout keep
+updating a few times per second even on slow links, while fast local copies
+quickly settle on large requests.
 
 ## Build
 
@@ -107,17 +118,19 @@ cargo build --release
 
 ## Tests
 
-- `cargo test` — unit tests for the bar renderer: fill excludes the
-  `(...)` text, arrow-head monotonicity, constant line width, pinned
-  `(`/`/`/`%`/`)` positions, humanized field padding, `COLUMNS`
-  override, sliding-ellipsis behavior.
+- `cargo test` — unit tests for the bar renderer and copy loop: fill
+  excludes the `(...)` text, arrow-head monotonicity, constant line
+  width, pinned `(`/`/`/`%`/`)` positions, humanized field padding,
+  `COLUMNS` override, sliding-ellipsis behavior, speed formatting and
+  layout, current-window vs. average speed math, adaptive chunk sizing.
 - `sh tests/vcp-suite.sh` (FreeBSD, after `cargo build --release`) —
-  105-check compatibility suite that runs `vcp` and `/bin/cp` side by
+  117-check compatibility suite that runs `vcp` and `/bin/cp` side by
   side and compares messages, exit codes and resulting trees (mtree),
   including `RESOLVE_BENEATH` escape refusal, plus pty checks
   (`script(1)`) of the rendered bars: forced `COLUMNS` width, constant
   line length, `/` and `%` never moving mid-copy, text region never
-  overwritten by the fill.
+  overwritten by the fill, speed line present under the bars in every
+  frame with pinned fields and a non-zero final average.
 
 ## Why
 

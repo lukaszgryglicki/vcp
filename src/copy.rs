@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::progress::Progress;
 use crate::{
@@ -13,11 +14,26 @@ use crate::{
     Options, To, O_SEARCH_FLAG, S_IFDIR, S_IFMT,
 };
 
-/// copy_file_range(2) chunk: big enough to be fast, small enough for
-/// smooth progress updates.
-const CFR_CHUNK: usize = 4 << 20;
-/// Read/write fallback buffer size.
-const BUF_SIZE: usize = 1 << 20;
+// Copy request sizes adapt to the observed throughput: start modest,
+// double while requests complete quickly, halve when they drag, so the
+// bars and the speed readout keep updating a few times per second on
+// slow links (sshfs, NFS over wifi) while fast local copies quickly
+// reach large requests.
+const CHUNK_MIN: usize = 64 << 10;
+const CHUNK_START: usize = 256 << 10;
+const CHUNK_MAX: usize = 4 << 20;
+const CHUNK_FAST: Duration = Duration::from_millis(50);
+const CHUNK_SLOW: Duration = Duration::from_millis(300);
+
+fn next_chunk(chunk: usize, took: Duration) -> usize {
+    if took < CHUNK_FAST {
+        (chunk * 2).min(CHUNK_MAX)
+    } else if took > CHUNK_SLOW {
+        (chunk / 2).max(CHUNK_MIN)
+    } else {
+        chunk
+    }
+}
 
 // cp does all destination-side work relative to the kept target dir fd
 // and, when recursing, with RESOLVE_BENEATH so a symlink in the copied
@@ -410,16 +426,18 @@ fn copy_bytes(
     let mut use_cfr = true;
     let mut buf: Vec<u8> = Vec::new();
     let mut wtotal: u64 = 0;
+    let mut chunk = CHUNK_START;
     loop {
         check_siginfo(a, wtotal, prog);
         if use_cfr {
+            let t = Instant::now();
             let n = unsafe {
                 libc::copy_file_range(
                     from_fd,
                     std::ptr::null_mut(),
                     to_fd,
                     std::ptr::null_mut(),
-                    CFR_CHUNK,
+                    chunk,
                     0,
                 )
             };
@@ -440,21 +458,24 @@ fn copy_bytes(
             } else if n == 0 {
                 return Ok(());
             } else {
+                chunk = next_chunk(chunk, t.elapsed());
                 wtotal += n as u64;
                 prog.add(n as u64);
             }
         } else {
             if buf.is_empty() {
-                buf = vec![0u8; BUF_SIZE];
+                buf = vec![0u8; CHUNK_MAX];
             }
+            let t = Instant::now();
             let mut fr = from;
-            match fr.read(&mut buf) {
+            match fr.read(&mut buf[..chunk]) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
                 Ok(0) => return Ok(()),
                 Ok(n) => {
                     let mut tw = to;
                     tw.write_all(&buf[..n])?;
+                    chunk = next_chunk(chunk, t.elapsed());
                     wtotal += n as u64;
                     prog.add(n as u64);
                 }
@@ -878,4 +899,28 @@ pub fn preserve_dir_acls(
     _prog: &mut Progress,
 ) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_chunk, CHUNK_MAX, CHUNK_MIN, CHUNK_START};
+    use std::time::Duration;
+
+    #[test]
+    fn chunk_adapts_to_throughput() {
+        // fast requests grow the chunk, up to the cap
+        assert_eq!(next_chunk(CHUNK_START, Duration::from_millis(1)), CHUNK_START * 2);
+        assert_eq!(next_chunk(CHUNK_MAX, Duration::from_millis(1)), CHUNK_MAX);
+        let mut c = CHUNK_START;
+        for _ in 0..10 {
+            c = next_chunk(c, Duration::from_millis(1));
+        }
+        assert_eq!(c, CHUNK_MAX);
+        // slow requests shrink it, down to the floor
+        assert_eq!(next_chunk(CHUNK_START, Duration::from_secs(1)), CHUNK_START / 2);
+        assert_eq!(next_chunk(CHUNK_MIN, Duration::from_secs(5)), CHUNK_MIN);
+        // comfortable range: unchanged
+        assert_eq!(next_chunk(CHUNK_START, Duration::from_millis(100)), CHUNK_START);
+        assert!(CHUNK_MIN < CHUNK_START && CHUNK_START < CHUNK_MAX);
+    }
 }

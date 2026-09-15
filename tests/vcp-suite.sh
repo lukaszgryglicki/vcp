@@ -324,6 +324,32 @@ COLUMNS=50 script -q wfcap sh -c \
 tr '\r' '\n' < wfcap | sed -E "s/${ESC}\[[0-9]*[A-Za-z]//g" | grep '^|' > wflines
 awk 'length($0)!=79{exit 1}' wflines && [ -s wflines ] && ok || bad wmin80-linelen
 
+### 37. speed line: always present right under the bars, boxed, pinned
+# three-bar capture from 35 (w3lines, 99 cols)
+grep '^speed: |' w3lines > wsp3
+[ -s wsp3 ] && ok || bad speed3-present
+awk 'length($0)!=99{exit 1}' wsp3 && ok || bad speed3-linelen
+grep -Evq '^speed: \| current +[0-9]+\.[0-9][0-9][0-9] [BKMGT]/s    average +[0-9]+\.[0-9][0-9][0-9] [BKMGT]/s +\|$' wsp3 \
+  && bad speed3-format || ok
+# every file: line is followed by a speed: line, and frames end with it
+awk '/^speed: \|/{f=0; next} /^file:  \|/{if(f) exit 1; f=1} END{if(f) exit 1}' w3lines \
+  && ok || bad speed3-under-bars
+# blank digits and units: every frame must then be identical (nothing moves)
+[ "$(sed -E 's/[0-9]/#/g; s/ [BKMGT]\/s/ #\/s/g' wsp3 | sort -u | wc -l | tr -d ' ')" = 1 ] \
+  && ok || bad speed3-pinned
+tail -1 wsp3 | grep -q 'average    0.000 B/s' && bad speed3-final-avg || ok
+# single-bar capture from 34 (wlines, 89 cols)
+grep '^| speed:' wlines > wsp1
+[ -s wsp1 ] && ok || bad speed1-present
+awk 'length($0)!=89{exit 1}' wsp1 && ok || bad speed1-linelen
+grep -Evq '^\| speed: current +[0-9]+\.[0-9][0-9][0-9] [BKMGT]/s    average +[0-9]+\.[0-9][0-9][0-9] [BKMGT]/s +\|$' wsp1 \
+  && bad speed1-format || ok
+awk '/^\| speed:/{f=0; next} /^\|/{if(f) exit 1; f=1} END{if(f) exit 1}' wlines \
+  && ok || bad speed1-under-bar
+[ "$(sed -E 's/[0-9]/#/g; s/ [BKMGT]\/s/ #\/s/g' wsp1 | sort -u | wc -l | tr -d ' ')" = 1 ] \
+  && ok || bad speed1-pinned
+tail -1 wsp1 | grep -q 'average    0.000 B/s' && bad speed1-final-avg || ok
+
 echo
 echo "passed=$pass failed=$fail"
 [ $fail -eq 0 ]
