@@ -117,11 +117,12 @@ struct Plan {
     rval: i32,
 }
 
-#[cfg(target_os = "freebsd")]
+// BSD file flags (chflags) exist on FreeBSD and macOS.
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
 fn stflags(st: &libc::stat) -> u32 {
     st.st_flags as u32
 }
-#[cfg(not(target_os = "freebsd"))]
+#[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
 fn stflags(_st: &libc::stat) -> u32 {
     0
 }
@@ -404,10 +405,14 @@ fn last_component(s: &OsStr) -> OsString {
     OsString::from_vec(b[start..end].to_vec())
 }
 
-#[cfg(target_os = "freebsd")]
+// Flag for opening the target directory as a "search-only" handle for
+// *at() calls: O_SEARCH on the BSDs (FreeBSD, macOS), O_PATH on Linux.
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
 pub const O_SEARCH_FLAG: libc::c_int = libc::O_SEARCH;
-#[cfg(not(target_os = "freebsd"))]
+#[cfg(target_os = "linux")]
 pub const O_SEARCH_FLAG: libc::c_int = libc::O_PATH;
+#[cfg(not(any(target_os = "freebsd", target_os = "macos", target_os = "linux")))]
+pub const O_SEARCH_FLAG: libc::c_int = libc::O_RDONLY;
 
 fn walk(
     src: &Path,

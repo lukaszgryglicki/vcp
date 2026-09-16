@@ -35,6 +35,25 @@ fn next_chunk(chunk: usize, took: Duration) -> usize {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn cfr(from_fd: i32, to_fd: i32, len: usize) -> isize {
+    unsafe {
+        libc::copy_file_range(
+            from_fd,
+            std::ptr::null_mut(),
+            to_fd,
+            std::ptr::null_mut(),
+            len,
+            0,
+        )
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn cfr(_from_fd: i32, _to_fd: i32, _len: usize) -> isize {
+    unsafe { *libc::__error() = libc::ENOSYS };
+    -1
+}
+
 // cp does all destination-side work relative to the kept target dir fd
 // and, when recursing, with RESOLVE_BENEATH so a symlink in the copied
 // tree cannot lead us out of the destination.
@@ -64,7 +83,8 @@ fn o_flags(to: &To, extra: libc::c_int) -> libc::c_int {
     extra | if to.beneath { O_BENEATH } else { 0 }
 }
 
-#[cfg(target_os = "freebsd")]
+// SIGINFO (Ctrl+T) exists on the BSDs including macOS.
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
 mod siginfo {
     use std::sync::atomic::{AtomicBool, Ordering};
     pub static INFO: AtomicBool = AtomicBool::new(false);
@@ -81,7 +101,7 @@ mod siginfo {
         INFO.swap(false, Ordering::Relaxed)
     }
 }
-#[cfg(not(target_os = "freebsd"))]
+#[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
 mod siginfo {
     pub fn install() {}
     pub fn take() -> bool {
@@ -423,7 +443,9 @@ fn copy_bytes(
 ) -> io::Result<()> {
     let from_fd = from.as_raw_fd();
     let to_fd = to.as_raw_fd();
-    let mut use_cfr = true;
+    // copy_file_range(2) exists on Linux and FreeBSD; elsewhere (macOS)
+    // go straight to the read/write loop.
+    let mut use_cfr = cfg!(any(target_os = "linux", target_os = "freebsd"));
     let mut buf: Vec<u8> = Vec::new();
     let mut wtotal: u64 = 0;
     let mut chunk = CHUNK_START;
@@ -431,16 +453,7 @@ fn copy_bytes(
         check_siginfo(a, wtotal, prog);
         if use_cfr {
             let t = Instant::now();
-            let n = unsafe {
-                libc::copy_file_range(
-                    from_fd,
-                    std::ptr::null_mut(),
-                    to_fd,
-                    std::ptr::null_mut(),
-                    chunk,
-                    0,
-                )
-            };
+            let n = cfr(from_fd, to_fd, chunk);
             if n < 0 {
                 let e = io::Error::last_os_error();
                 match e.raw_os_error() {
@@ -740,7 +753,33 @@ pub fn setfile(
             }
         }
     }
-    #[cfg(not(target_os = "freebsd"))]
+    #[cfg(target_os = "macos")]
+    {
+        // macOS has BSD file flags but no chflagsat() (and libc exposes
+        // no lchflags), so use fchflags()/chflags() and leave symlinks'
+        // flags alone; `dst` is the full destination path.
+        let flags_needed = match &now {
+            Some(n) => meta.flags != n.flags,
+            None => true,
+        };
+        if !opts.no_flags && flags_needed && !(fd.is_none() && islink) {
+            let cd = cstr(dst);
+            let r = unsafe {
+                match fd {
+                    Some(f) => libc::fchflags(f, meta.flags as libc::c_uint),
+                    None => libc::chflags(cd.as_ptr(), meta.flags as libc::c_uint),
+                }
+            };
+            if r != 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EOPNOTSUPP) || meta.flags != 0 {
+                    prog.warn(&format!("chflags: {}: {}", dst.display(), err_str(&e)));
+                    rval = true;
+                }
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
     {
         let _ = &opts.no_flags;
     }

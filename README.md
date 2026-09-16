@@ -99,15 +99,26 @@ post-order, exit status 1 on any failure, 64 on usage errors, messages match
 cp's wording. Like cp, recursive copies do all destination-side work relative
 to a file descriptor of the target directory with `RESOLVE_BENEATH`
 resolution, so a symlink already present in the destination cannot redirect
-writes outside of it (refused with `Permission denied`). File flags
-(`chflags`) and NFSv4/POSIX.1e ACL preservation with `-p` are FreeBSD-only;
-on Linux those steps (and `RESOLVE_BENEATH`) are skipped.
+writes outside of it (refused with `Permission denied`).
 
-Copying uses `copy_file_range(2)` with a read/write fallback. Request sizes
+Copying uses `copy_file_range(2)` (Linux, FreeBSD) with a read/write
+fallback (always used on macOS). Request sizes
 adapt to the observed throughput (64K–4M: doubling while requests complete
 quickly, halving when they drag), so the bars and the speed readout keep
 updating a few times per second even on slow links, while fast local copies
 quickly settle on large requests.
+
+## Portability
+
+Builds and runs on FreeBSD, Linux and macOS (selected at compile time):
+
+| Feature | FreeBSD | macOS | Linux |
+|---------|---------|-------|-------|
+| `RESOLVE_BENEATH` destination containment | yes | no (no kernel support) | no |
+| `-p` file flags (`chflags`) | yes | yes (not on symlinks) | n/a |
+| `-p` NFSv4/POSIX.1e ACLs | yes | no | no |
+| `copy_file_range(2)` fast path | yes | no (read/write) | yes |
+| `SIGINFO` (Ctrl+T) status line | yes | yes | n/a |
 
 ## Build
 
