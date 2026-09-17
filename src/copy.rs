@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::progress::Progress;
+use crate::reconcile::Outcome;
 use crate::{
     atstat, cstr, err_str, fxstat, strerror, Action, Clobber, DirFixup, Kind, LinkMode, Meta,
     Options, To, O_SEARCH_FLAG, S_IFDIR, S_IFMT,
@@ -75,12 +76,52 @@ fn relc(rel: &Path) -> std::ffi::CString {
     }
 }
 
-fn at_flags(to: &To, extra: libc::c_int) -> libc::c_int {
+pub fn at_flags(to: &To, extra: libc::c_int) -> libc::c_int {
     extra | if to.beneath { AT_BENEATH } else { 0 }
 }
 
 fn o_flags(to: &To, extra: libc::c_int) -> libc::c_int {
     extra | if to.beneath { O_BENEATH } else { 0 }
+}
+
+/// --remove-gone bookkeeping: identity of the destination entry just made.
+/// Source disappeared (or a parent directory was replaced by a non-directory).
+pub fn is_gone(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR))
+}
+
+fn note_owned(out: &mut Outcome, opts: &Options, to: &To, rel: &Path) {
+    if opts.remove_gone {
+        out.owned = atstat(to, rel, at_flags(to, libc::AT_SYMLINK_NOFOLLOW))
+            .ok()
+            .map(|m| (m.dev, m.ino));
+    }
+}
+
+/// --remove-gone: unlink (or rmdir) a destination entry made by this run.
+/// Ok(true) = removed, Ok(false) = directory not empty (left alone),
+/// Err = failure (reported).
+pub fn remove_entry(to: &To, rel: &Path, dst: &Path, dir: bool, opts: &Options) -> Result<bool, ()> {
+    let rc = relc(rel);
+    let flags = at_flags(to, if dir { libc::AT_REMOVEDIR } else { 0 });
+    if unsafe { libc::unlinkat(to.dirfd, rc.as_ptr(), flags) } != 0 {
+        let e = io::Error::last_os_error();
+        if dir && matches!(e.raw_os_error(), Some(libc::ENOTEMPTY) | Some(libc::EEXIST)) {
+            return Ok(false); // holds things this run did not make
+        }
+        eprintln!(
+            "vcp: {}: {}: {}",
+            if dir { "rmdir" } else { "unlink" },
+            dst.display(),
+            err_str(&e)
+        );
+        return Err(());
+    }
+    if opts.verbose {
+        println!("deleting {}", dst.display());
+        let _ = io::stdout().flush();
+    }
+    Ok(true)
 }
 
 // SIGINFO (Ctrl+T) exists on the BSDs including macOS.
@@ -136,19 +177,20 @@ pub fn exec_action(
     prog: &mut Progress,
     fixups: &mut [DirFixup],
     skips: &mut Vec<std::path::PathBuf>,
+    out: &mut Outcome,
 ) -> bool {
     let bad = match a.kind {
-        Kind::File => copy_file(a, opts, to, prog),
-        Kind::Dir { fixup } => copy_dir(a, opts, to, prog, fixups, fixup, skips),
-        Kind::Symlink => copy_link(a, opts, to, prog),
-        Kind::Fifo => copy_fifo(a, opts, to, prog),
-        Kind::Special => copy_special(a, opts, to, prog),
+        Kind::File => copy_file(a, opts, to, prog, out),
+        Kind::Dir { fixup } => copy_dir(a, opts, to, prog, fixups, fixup, skips, out),
+        Kind::Symlink => copy_link(a, opts, to, prog, out),
+        Kind::Fifo => copy_fifo(a, opts, to, prog, out),
+        Kind::Special => copy_special(a, opts, to, prog, out),
         Kind::Socket => {
             prog.warn(&format!("{} is a socket (not copied).", a.src.display()));
             false
         }
     };
-    if opts.verbose && !bad {
+    if opts.verbose && !bad && !out.vanished {
         prog.out(&format!(
             "{} -> {}{}",
             a.src.display(),
@@ -167,6 +209,7 @@ fn copy_dir(
     fixups: &mut [DirFixup],
     fx: usize,
     skips: &mut Vec<std::path::PathBuf>,
+    out: &mut Outcome,
 ) -> bool {
     // DIR_TO_DNE root: create the target directory itself and keep an fd
     // to it; everything below is done relative to (and beneath) it.
@@ -196,6 +239,9 @@ fn copy_dir(
         }
         to.dirfd = fd;
         fixups[fx].created = true;
+        if opts.remove_gone {
+            out.owned = fxstat(fd).ok().map(|m| (m.dev, m.ino));
+        }
         return false;
     }
 
@@ -231,6 +277,7 @@ fn copy_dir(
                 return true;
             }
             fixups[fx].created = true;
+            note_owned(out, opts, to, &a.rel);
         }
         Ok(dm) if dm.mode & S_IFMT != S_IFDIR => {
             prog.warn(&format!(
@@ -270,14 +317,20 @@ fn mkdir_juggled<F: FnOnce(libc::mode_t) -> libc::c_int>(
     (r, e)
 }
 
-fn copy_file(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> bool {
+fn copy_file(a: &Action, opts: &Options, to: &To, prog: &mut Progress, out: &mut Outcome) -> bool {
     prog.file_start(&a.src.display().to_string(), a.meta.size);
-    let bad = copy_file_inner(a, opts, to, prog);
+    let bad = copy_file_inner(a, opts, to, prog, out);
     prog.file_end();
     bad
 }
 
-fn copy_file_inner(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> bool {
+fn copy_file_inner(
+    a: &Action,
+    opts: &Options,
+    to: &To,
+    prog: &mut Progress,
+    out: &mut Outcome,
+) -> bool {
     // Identical-file check against the (followed) destination.
     let dstat = atstat(to, &a.rel, at_flags(to, 0));
     if let Ok(dm) = &dstat {
@@ -297,6 +350,12 @@ fn copy_file_inner(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> 
     if opts.link == LinkMode::Copy {
         let f = match fs::File::open(&a.src) {
             Err(e) => {
+                if opts.remove_gone && is_gone(&e) {
+                    // --remove-gone: vanished before its turn; the
+                    // re-scan decides whether it is gone for good
+                    out.vanished = true;
+                    return false;
+                }
                 prog.warn(&format!("{}: {}", a.src.display(), err_str(&e)));
                 return true;
             }
@@ -357,6 +416,7 @@ fn copy_file_inner(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> 
                 ));
                 return true;
             }
+            note_owned(out, opts, to, &a.rel);
             return false;
         }
         LinkMode::Sym => {
@@ -370,6 +430,7 @@ fn copy_file_inner(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> 
                 ));
                 return true;
             }
+            note_owned(out, opts, to, &a.rel);
             return false;
         }
         LinkMode::Copy => {}
@@ -397,6 +458,9 @@ fn copy_file_inner(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> 
         return true;
     }
     let to_file = unsafe { fs::File::from_raw_fd(tfd) };
+    if opts.remove_gone {
+        out.owned = fxstat(tfd).ok().map(|m| (m.dev, m.ino));
+    }
 
     let mut rval = false;
     if let Err(e) = copy_bytes(&from, &to_file, a, prog) {
@@ -497,7 +561,7 @@ fn copy_bytes(
     }
 }
 
-fn copy_link(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> bool {
+fn copy_link(a: &Action, opts: &Options, to: &To, prog: &mut Progress, out: &mut Outcome) -> bool {
     let dstat = atstat(to, &a.rel, at_flags(to, libc::AT_SYMLINK_NOFOLLOW));
     if let Ok(dm) = &dstat {
         if dm.dev == a.meta.dev && dm.ino == a.meta.ino {
@@ -518,6 +582,10 @@ fn copy_link(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> bool {
     }
     let target = match fs::read_link(&a.src) {
         Err(e) => {
+            if opts.remove_gone && is_gone(&e) {
+                out.vanished = true;
+                return false;
+            }
             prog.warn(&format!("readlink: {}: {}", a.src.display(), err_str(&e)));
             return true;
         }
@@ -544,6 +612,7 @@ fn copy_link(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> bool {
         ));
         return true;
     }
+    note_owned(out, opts, to, &a.rel);
     if opts.preserve {
         return setfile(&a.meta, None, to, &a.rel, &a.dst, true, opts, prog);
     }
@@ -585,7 +654,7 @@ fn clobber_precheck(a: &Action, opts: &Options, to: &To, prog: &mut Progress) ->
     None
 }
 
-fn copy_fifo(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> bool {
+fn copy_fifo(a: &Action, opts: &Options, to: &To, prog: &mut Progress, out: &mut Outcome) -> bool {
     if let Some(bad) = clobber_precheck(a, opts, to, prog) {
         return bad;
     }
@@ -600,13 +669,20 @@ fn copy_fifo(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> bool {
         ));
         return true;
     }
+    note_owned(out, opts, to, &a.rel);
     if opts.preserve {
         return setfile(&a.meta, None, to, &a.rel, &a.dst, false, opts, prog);
     }
     false
 }
 
-fn copy_special(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> bool {
+fn copy_special(
+    a: &Action,
+    opts: &Options,
+    to: &To,
+    prog: &mut Progress,
+    out: &mut Outcome,
+) -> bool {
     if let Some(bad) = clobber_precheck(a, opts, to, prog) {
         return bad;
     }
@@ -627,6 +703,7 @@ fn copy_special(a: &Action, opts: &Options, to: &To, prog: &mut Progress) -> boo
         ));
         return true;
     }
+    note_owned(out, opts, to, &a.rel);
     if opts.preserve {
         return setfile(&a.meta, None, to, &a.rel, &a.dst, false, opts, prog);
     }

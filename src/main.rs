@@ -5,6 +5,7 @@
 
 mod copy;
 mod progress;
+mod reconcile;
 
 use std::env;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -13,8 +14,10 @@ use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::time::{Duration, SystemTime};
 
 use progress::Progress;
+use reconcile::{Outcome, State};
 
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFIFO: u32 = 0o010000;
@@ -55,6 +58,11 @@ pub struct Options {
     pub sort: bool,     // --sort
     pub mask: u32,      // ~umask & 07777
     pub umask: u32,     // umask & 07777
+    // vcp extensions (see reconcile.rs); all off by default
+    pub copy_new: bool,    // --copy-new (also set by --reconcile)
+    pub remove_gone: bool, // --remove-gone (also set by --reconcile)
+    pub passes: u32,       // --passes=N, 0 = until nothing changes
+    pub settle: u64,       // --settle=SEC, 0 = off
 }
 
 #[derive(Clone)]
@@ -90,6 +98,8 @@ pub struct Action {
     pub meta: Meta,
     /// print dst with a trailing '/' in -v output (DIR_TO_DNE root, like cp)
     pub slash: bool,
+    /// command-line operand (walk level 0)
+    pub root: bool,
 }
 
 /// Destination context, mirroring cp's PATH_T: all destination-side
@@ -115,6 +125,8 @@ struct Plan {
     actions: Vec<Action>,
     fixups: Vec<DirFixup>,
     rval: i32,
+    /// reconcile re-scan: entries vanishing under us are not errors
+    rescan: bool,
 }
 
 // BSD file flags (chflags) exist on FreeBSD and macOS.
@@ -243,6 +255,10 @@ struct RawFlags {
     v: bool,
     x: bool,
     sort: bool,
+    copy_new: bool,
+    remove_gone: bool,
+    passes: u32,
+    settle: u64,
 }
 
 // Long options of FreeBSD 15 cp(1); "sort" maps to the internal 'S'.
@@ -321,6 +337,65 @@ fn apply_flag(c: char, r: &mut RawFlags) {
 
 const SHORT_OPTS: &str = "HLPRafilNnprsvx";
 
+/// vcp extensions (not in cp): matched by exact name only, so that the
+/// abbreviations of cp's own long options keep working unchanged
+/// ("--rec" is still --recursive).  Returns false if `name` is not one.
+fn vcp_long_opt(
+    name: &str,
+    value: Option<&[u8]>,
+    next: Option<&OsString>,
+    used_next: &mut bool,
+    raw: &mut RawFlags,
+) -> bool {
+    let takes_arg = matches!(name, "passes" | "settle");
+    if !matches!(name, "copy-new" | "remove-gone" | "reconcile" | "passes" | "settle") {
+        return false;
+    }
+    if !takes_arg {
+        if value.is_some() {
+            eprintln!("vcp: option `--{}' doesn't allow an argument", name);
+            usage();
+        }
+        match name {
+            "copy-new" => raw.copy_new = true,
+            "remove-gone" => raw.remove_gone = true,
+            _ => {
+                raw.copy_new = true;
+                raw.remove_gone = true;
+            }
+        }
+        return true;
+    }
+    let v: &[u8] = match value {
+        Some(v) => v,
+        None => match next {
+            Some(n) => {
+                *used_next = true;
+                n.as_bytes()
+            }
+            None => {
+                eprintln!("vcp: option `--{}' requires an argument", name);
+                usage();
+            }
+        },
+    };
+    let n = String::from_utf8_lossy(v)
+        .parse::<u64>()
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "vcp: --{}: invalid number `{}'",
+                name,
+                String::from_utf8_lossy(v)
+            );
+            usage();
+        });
+    match name {
+        "passes" => raw.passes = n.min(u32::MAX as u64) as u32,
+        _ => raw.settle = n,
+    }
+    true
+}
+
 /// BSD getopt behavior: option parsing stops at the first non-option
 /// argument ("+" prefix in cp's getopt_long call).
 fn parse_args() -> (RawFlags, Vec<OsString>) {
@@ -340,6 +415,12 @@ fn parse_args() -> (RawFlags, Vec<OsString>) {
                 None => (body, false),
             };
             let name_s = String::from_utf8_lossy(name).into_owned();
+            let value = if has_eq { Some(&body[name.len() + 1..]) } else { None };
+            let mut used_next = false;
+            if vcp_long_opt(&name_s, value, args.get(idx + 1), &mut used_next, &mut raw) {
+                idx += 1 + used_next as usize;
+                continue;
+            }
             let mut hits: Vec<char> = LONG_OPTS
                 .iter()
                 .filter(|(n, _)| n.starts_with(name_s.as_str()))
@@ -444,10 +525,14 @@ fn walk(
                             kind: Kind::File,
                             meta: lm,
                             slash: false,
+                            root: level == 0,
                         });
                         return;
                     }
                 }
+            }
+            if plan.rescan && level > 0 && copy::is_gone(&e) {
+                return; // gone between readdir and stat: just not there
             }
             eprintln!("vcp: {}: {}", src.display(), err_str(&e));
             plan.rval = 1;
@@ -488,12 +573,16 @@ fn walk(
                 kind: Kind::Dir { fixup },
                 meta: meta.clone(),
                 slash: false,
+                root: level == 0,
             });
             if level > 0 && opts.one_fs && meta.dev != rdev {
                 return; // -x: do not traverse mount points
             }
             match fs::read_dir(src) {
                 Err(e) => {
+                    if plan.rescan && level > 0 && copy::is_gone(&e) {
+                        return;
+                    }
                     eprintln!("vcp: {}: {}", src.display(), err_str(&e));
                     plan.rval = 1;
                 }
@@ -554,6 +643,7 @@ fn walk(
         kind,
         meta,
         slash: false,
+        root: level == 0,
     });
 }
 
@@ -561,6 +651,68 @@ enum TargetType {
     ToFile,   // cp file1 file2
     ToDir,    // cp file ... dir
     DirToDne, // cp -R dir newdir
+}
+
+/// Plan phase: walk the sources, snapshot what has to be done.
+fn build_plan(
+    ttype: &TargetType,
+    operands: &[OsString],
+    target: &Path,
+    opts: &Options,
+    rescan: bool,
+) -> Plan {
+    let mut plan = Plan {
+        rescan,
+        ..Plan::default()
+    };
+    let mut anc: Vec<(u64, u64)> = Vec::new();
+    match ttype {
+        TargetType::ToFile | TargetType::DirToDne => {
+            let rel = if matches!(ttype, TargetType::ToFile) {
+                target.to_path_buf() // ops via AT_FDCWD use the full path
+            } else {
+                PathBuf::new() // created root; children relative to it
+            };
+            walk(
+                Path::new(&operands[0]),
+                target.to_path_buf(),
+                rel,
+                0,
+                None,
+                opts,
+                &mut anc,
+                &mut plan,
+            );
+            // cp prints the created root as "target/" in -v output
+            if matches!(ttype, TargetType::DirToDne) {
+                if let Some(a) = plan.actions.first_mut() {
+                    if matches!(a.kind, Kind::Dir { .. }) && a.dst == target {
+                        a.slash = true;
+                    }
+                }
+            }
+        }
+        TargetType::ToDir => {
+            for s in operands {
+                let name = last_component(s);
+                let (dst, rel) = if name.as_bytes() == b"/" {
+                    (target.to_path_buf(), PathBuf::new())
+                } else {
+                    (target.join(&name), PathBuf::from(&name))
+                };
+                walk(Path::new(s), dst, rel, 0, None, opts, &mut anc, &mut plan);
+            }
+        }
+    }
+    plan
+}
+
+/// Seconds since the epoch, for --settle.
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn main() {
@@ -613,7 +765,21 @@ fn main() {
         sort: raw.sort,
         mask: !(om as u32) & 0o7777,
         umask: (om as u32) & 0o7777,
+        copy_new: raw.copy_new,
+        remove_gone: raw.remove_gone,
+        passes: raw.passes,
+        settle: raw.settle,
     };
+    let reconcile = opts.copy_new || opts.remove_gone;
+    if reconcile && !recursive {
+        errx1("--copy-new, --remove-gone and --reconcile require -R");
+    }
+    if (raw.passes != 0 || raw.settle != 0) && !reconcile {
+        errx1("--passes and --settle require --copy-new, --remove-gone or --reconcile");
+    }
+    if raw.settle != 0 && !opts.copy_new {
+        errx1("--settle requires --copy-new or --reconcile");
+    }
 
     // Target processing (trailing slashes, empty target), like cp.
     let mut tb = operands.pop().unwrap().into_vec();
@@ -698,56 +864,127 @@ fn main() {
         t
     };
 
-    // Plan phase: walk the sources, snapshot what has to be done.
-    let mut plan = Plan::default();
-    let mut anc: Vec<(u64, u64)> = Vec::new();
-    match ttype {
-        TargetType::ToFile | TargetType::DirToDne => {
-            let rel = if matches!(ttype, TargetType::ToFile) {
-                target.clone() // ops via AT_FDCWD use the full path
-            } else {
-                PathBuf::new() // created root; children relative to it
-            };
-            walk(
-                Path::new(&operands[0]),
-                target.clone(),
-                rel,
-                0,
-                None,
-                &opts,
-                &mut anc,
-                &mut plan,
-            );
-            // cp prints the created root as "target/" in -v output
-            if matches!(ttype, TargetType::DirToDne) {
-                if let Some(a) = plan.actions.first_mut() {
-                    if matches!(a.kind, Kind::Dir { .. }) && a.dst == target {
-                        a.slash = true;
+    // fts with a comparator sorts the root set as well
+    if opts.sort && matches!(ttype, TargetType::ToDir) {
+        operands.sort_by(|a, b| {
+            last_component(a)
+                .as_bytes()
+                .cmp(last_component(b).as_bytes())
+        });
+    }
+
+    let mut plan = build_plan(&ttype, &operands, &target, &opts, false);
+    let mut rval = plan.rval;
+    let mut state = State::new();
+    if opts.settle != 0 {
+        // hold back files still being written; a later phase gets them
+        let d = reconcile::diff(&state, &plan.actions, &opts, now_epoch());
+        filter_plan(&mut plan, &d.keep);
+    }
+    let notices = opts.verbose || unsafe { libc::isatty(libc::STDERR_FILENO) == 1 };
+    let mut phase: u32 = 0;
+    let mut waiting = false;
+
+    loop {
+        // One phase: bars, speed and ETA cover this phase's plan only.
+        if run_phase(&plan, &opts, &mut to, &mut state) {
+            rval = 1;
+        }
+        if !reconcile || (matches!(ttype, TargetType::DirToDne) && to.dirfd < 0) {
+            break;
+        }
+        // Re-scan; schedule another pass while the source keeps changing.
+        let mut next: Option<Plan> = None;
+        loop {
+            let scan = build_plan(&ttype, &operands, &target, &opts, true);
+            if scan.rval != 0 {
+                rval = 1;
+            }
+            let d = reconcile::diff(&state, &scan.actions, &opts, now_epoch());
+            let work = d.new + d.changed > 0 || (opts.remove_gone && !d.removed.is_empty());
+            if (work || d.unsettled > 0) && opts.passes != 0 && phase >= opts.passes {
+                eprintln!(
+                    "vcp: source still changing after {} reconcile pass{}; destination may be out of sync",
+                    opts.passes,
+                    if opts.passes == 1 { "" } else { "es" }
+                );
+                rval = 1;
+                break;
+            }
+            if !work {
+                match d.wait {
+                    Some(w) if d.unsettled > 0 => {
+                        if notices && !waiting {
+                            eprintln!(
+                                "vcp: waiting for {} unsettled file{}",
+                                d.unsettled,
+                                if d.unsettled == 1 { "" } else { "s" }
+                            );
+                        }
+                        waiting = true;
+                        std::thread::sleep(w.max(Duration::from_millis(100)));
+                        continue;
+                    }
+                    _ => break, // in sync
+                }
+            }
+            phase += 1;
+            waiting = false;
+            if notices {
+                let gone = d
+                    .removed
+                    .iter()
+                    .filter(|r| state.get(*r).is_some_and(|e| e.owned.is_some() && !e.root))
+                    .count();
+                eprintln!(
+                    "vcp: reconcile pass {}: {} new, {} changed, {} gone{}",
+                    phase,
+                    d.new,
+                    d.changed,
+                    gone,
+                    if d.unsettled > 0 {
+                        format!(", {} unsettled", d.unsettled)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            if opts.remove_gone {
+                for rel in &d.removed {
+                    if remove_gone(rel, &mut state, &opts, &to).is_err() {
+                        rval = 1;
                     }
                 }
             }
+            let mut p = scan;
+            filter_plan(&mut p, &d.keep);
+            next = Some(p);
+            break;
         }
-        TargetType::ToDir => {
-            // fts with a comparator sorts the root set as well
-            if opts.sort {
-                operands.sort_by(|a, b| {
-                    last_component(a)
-                        .as_bytes()
-                        .cmp(last_component(b).as_bytes())
-                });
-            }
-            for s in &operands {
-                let name = last_component(s);
-                let (dst, rel) = if name.as_bytes() == b"/" {
-                    (target.clone(), PathBuf::new())
-                } else {
-                    (target.join(&name), PathBuf::from(&name))
-                };
-                walk(Path::new(s), dst, rel, 0, None, &opts, &mut anc, &mut plan);
-            }
+        match next {
+            Some(p) => plan = p,
+            None => break,
         }
     }
+    exit(rval);
+}
 
+/// Keep only the actions selected for this pass; directories dropped
+/// from the pass are not fixed up either.
+fn filter_plan(plan: &mut Plan, keep: &[bool]) {
+    let actions = std::mem::take(&mut plan.actions);
+    for (a, k) in actions.into_iter().zip(keep) {
+        if *k {
+            plan.actions.push(a);
+        } else if let Kind::Dir { fixup } = a.kind {
+            plan.fixups[fixup].failed = true;
+        }
+    }
+}
+
+/// Execute one plan: copy everything, then fix up directory attributes.
+/// Returns true if anything failed.
+fn run_phase(plan: &Plan, opts: &Options, to: &mut To, state: &mut State) -> bool {
     let total_files = plan
         .actions
         .iter()
@@ -763,14 +1000,26 @@ fn main() {
         0
     };
 
-    let mut rval = plan.rval;
-    let mut fixups = plan.fixups;
+    let mut bad = false;
+    let mut fixups: Vec<DirFixup> = plan
+        .fixups
+        .iter()
+        .map(|f| DirFixup {
+            src: f.src.clone(),
+            dst: f.dst.clone(),
+            rel: f.rel.clone(),
+            meta: f.meta.clone(),
+            created: f.created,
+            failed: f.failed,
+        })
+        .collect();
     let mut prog = Progress::new(total_files, total_bytes);
     prog.start();
 
     // Execution phase.
     let mut skips: Vec<PathBuf> = Vec::new();
     for a in &plan.actions {
+        let mut out = Outcome::default();
         if skips.iter().any(|s| a.dst.starts_with(s)) {
             match a.kind {
                 Kind::File => {
@@ -781,10 +1030,11 @@ fn main() {
                 Kind::Dir { fixup } => fixups[fixup].failed = true,
                 _ => {}
             }
-            continue;
+        } else if copy::exec_action(a, opts, to, &mut prog, &mut fixups, &mut skips, &mut out) {
+            bad = true;
         }
-        if copy::exec_action(a, &opts, &mut to, &mut prog, &mut fixups, &mut skips) {
-            rval = 1;
+        if opts.copy_new || opts.remove_gone {
+            reconcile::record(state, a, &out);
         }
     }
 
@@ -796,11 +1046,11 @@ fn main() {
             continue;
         }
         if opts.preserve {
-            if copy::setfile(&f.meta, None, &to, &f.rel, &f.dst, false, &opts, &mut prog) {
-                rval = 1;
+            if copy::setfile(&f.meta, None, to, &f.rel, &f.dst, false, opts, &mut prog) {
+                bad = true;
             }
-            if copy::preserve_dir_acls(&f.src, &to, &f.rel, &f.dst, &mut prog) {
-                rval = 1;
+            if copy::preserve_dir_acls(&f.src, to, &f.rel, &f.dst, &mut prog) {
+                bad = true;
             }
         } else {
             let c = if f.rel.as_os_str().is_empty() {
@@ -822,11 +1072,52 @@ fn main() {
                     f.dst.display(),
                     err_str(&io::Error::last_os_error())
                 ));
-                rval = 1;
+                bad = true;
             }
         }
     }
 
     prog.finish();
-    exit(rval);
+    bad
+}
+
+/// --remove-gone: delete one destination entry that disappeared from the
+/// source, provided this run made it and it still is what we made.
+/// Ok(true) = removed, Ok(false) = nothing to do, Err = failure.
+fn remove_gone(rel: &Path, state: &mut State, opts: &Options, to: &To) -> Result<bool, ()> {
+    let e = match state.get(rel) {
+        Some(e) => e,
+        None => return Ok(false),
+    };
+    if e.root {
+        return Ok(false);
+    }
+    let owned = match e.owned {
+        Some(id) => id,
+        None => {
+            state.remove(rel); // never ours: forget it
+            return Ok(false);
+        }
+    };
+    let dst = e.dst.clone();
+    let cur = match atstat(to, rel, copy::at_flags(to, libc::AT_SYMLINK_NOFOLLOW)) {
+        Ok(m) => m,
+        Err(_) => {
+            state.remove(rel); // already gone
+            return Ok(false);
+        }
+    };
+    if (cur.dev, cur.ino) != owned {
+        state.remove(rel); // replaced by someone else: not ours any more
+        return Ok(false);
+    }
+    let dir = cur.mode & S_IFMT == S_IFDIR;
+    match copy::remove_entry(to, rel, &dst, dir, opts) {
+        Ok(true) => {
+            state.remove(rel);
+            Ok(true)
+        }
+        Ok(false) => Ok(false), // non-empty directory: keep it (and ours)
+        Err(()) => Err(()),
+    }
 }

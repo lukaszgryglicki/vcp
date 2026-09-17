@@ -394,6 +394,132 @@ tail -1 weta1 | grep -q 'current                done    average                d
 [ "$(head -1 wsp3 | awk '{print index($0,"current")}')" = "$(head -1 weta3 | awk '{print index($0,"current")}')" ] \
   && ok || bad eta3-aligned-with-speed
 
+### 39. reconcile mode (--copy-new / --remove-gone / --reconcile / --passes / --settle)
+# Timing trick: with -i vcp blocks at the overwrite prompt for an existing
+# destination file; the source is changed while it waits, then the answer
+# lets phase 0 finish and the re-scan finds the changes.  DIR_TO_DNE has
+# nothing to prompt about, so --settle is the pause there.
+OLD=202001020304.05
+# -i prompts go to stderr without a newline; strip them from captured stderr
+rcerr() { sed -E 's/overwrite [^?]*\? \(y\/n \[n\]\) //g' rce; }
+# 39a. option validation (all off by default; cp abbreviations untouched)
+$V --reconcile a.txt rc0.txt 2>rce; chk rc-needs-R-rc 1 $?
+chk rc-needs-R-msg "vcp: --copy-new, --remove-gone and --reconcile require -R" "$(cat rce)"
+$V -R --passes=2 a.txt rc0.txt 2>rce; chk rc-passes-needs-rc 1 $?
+chk rc-passes-needs-msg "vcp: --passes and --settle require --copy-new, --remove-gone or --reconcile" "$(cat rce)"
+$V -R --remove-gone --settle=1 a.txt rc0.txt 2>rce; chk rc-settle-needs-copy-new 1 $?
+$V -R --reconcile --passes=x a.txt rc0.txt 2>rce; chk rc-passes-bad-rc 64 $?
+chk rc-passes-bad-msg "vcp: --passes: invalid number \`x'" "$(head -1 rce)"
+$V -R --reconcile --passes a.txt 2>rce; chk rc-passes-missing-rc 64 $?
+$V -R --copy-new=1 a.txt rc0.txt 2>rce; chk rc-noarg-rc 64 $?
+$V --rec a.txt rc0.txt 2>/dev/null; chk rc-abbrev-still-recursive 0 $?   # --rec = --recursive
+rm -f rc0.txt
+$V -R --reconcile a.txt rc0.txt 2>rce; chk rc-single-file-ok 0 $?      # no changes -> one phase
+cmp -s a.txt rc0.txt && ok || bad rc-single-file-content
+[ -s rce ] && bad "rc-single-file-quiet ($(cat rce))" || ok
+# 39b. --reconcile: copied file removed from source -> deleted; file that
+# vanished before its turn -> not an error; new file -> copied; extras kept
+rm -rf rs rd; mkdir -p rs rd/rs
+echo old > rs/a_old; echo p > rs/b_prompt; echo late > rs/c_late; echo stale > rd/rs/b_prompt; echo extra > rd/rs/extra
+( sleep 1; rm rs/a_old rs/c_late; echo new > rs/d_new; echo y ) | $V -R -i -v --sort --reconcile rs rd >rco 2>rce
+chk rc-recon-rc 0 $?
+chk rc-recon-tree "b_prompt d_new extra" "$(ls rd/rs | tr '\n' ' ' | sed 's/ $//')"
+grep -q '^deleting rd/rs/a_old$' rco && ok || bad rc-recon-deleting-line
+grep -q '^rs/d_new -> rd/rs/d_new$' rco && ok || bad rc-recon-new-copied
+grep -q 'c_late' rce && bad "rc-recon-vanished-silent ($(cat rce))" || ok
+rcerr | grep -q '^vcp: reconcile pass 1: 1 new, 0 changed, 1 gone$' && ok || bad "rc-recon-notice ($(rcerr))"
+chk rc-recon-one-pass 1 "$(grep -c 'reconcile pass' rce)"
+# 39c. same run without the options: vanished file is an error, nothing deleted (unchanged behavior)
+rm -rf rs rd; mkdir -p rs rd/rs
+echo old > rs/a_old; echo p > rs/b_prompt; echo late > rs/c_late; echo stale > rd/rs/b_prompt
+( sleep 1; rm rs/a_old rs/c_late; echo new > rs/d_new; echo y ) | $V -R -i -v --sort rs rd >rco 2>rce
+chk rc-plain-rc 1 $?
+chk rc-plain-msg "vcp: rs/c_late: No such file or directory" "$(rcerr)"
+chk rc-plain-tree "a_old b_prompt" "$(ls rd/rs | tr '\n' ' ' | sed 's/ $//')"
+# 39d. --copy-new only: new file copied, gone file kept, vanished file still an error
+rm -rf rs rd; mkdir -p rs rd/rs
+echo old > rs/a_old; echo p > rs/b_prompt; echo late > rs/c_late; echo stale > rd/rs/b_prompt
+( sleep 1; rm rs/a_old rs/c_late; echo new > rs/d_new; echo y ) | $V -R -i -v --sort --copy-new rs rd >rco 2>rce
+chk rc-copynew-rc 1 $?
+chk rc-copynew-tree "a_old b_prompt d_new" "$(ls rd/rs | tr '\n' ' ' | sed 's/ $//')"
+grep -q 'c_late: No such file' rce && ok || bad rc-copynew-vanish-error
+# 39e. --remove-gone only: gone file deleted, new file not copied
+rm -rf rs rd; mkdir -p rs rd/rs
+echo old > rs/a_old; echo p > rs/b_prompt; echo stale > rd/rs/b_prompt
+( sleep 1; rm rs/a_old; echo new > rs/d_new; echo y ) | $V -R -i -v --sort --remove-gone rs rd >rco 2>rce
+chk rc-rmgone-rc 0 $?
+chk rc-rmgone-tree "b_prompt" "$(ls rd/rs | tr '\n' ' ' | sed 's/ $//')"
+# 39f. changed file (rewritten in place while blocked) is re-copied
+rm -rf rs rd; mkdir -p rs rd/rs
+echo old > rs/a_old; echo p > rs/b_prompt; echo stale > rd/rs/b_prompt
+# (the re-copy of a_old prompts again under -i, hence the second answer)
+( sleep 1; echo rewritten > rs/a_old; echo y; echo y ) | $V -R -i -v --sort --reconcile rs rd >rco 2>rce
+chk rc-changed-rc 0 $?
+chk rc-changed-content rewritten "$(cat rd/rs/a_old)"
+rcerr | grep -q '^vcp: reconcile pass 1: 0 new, 1 changed, 0 gone$' && ok || bad "rc-changed-notice ($(rcerr))"
+chk rc-changed-prompts 2 "$(grep -o 'overwrite rd/rs/' rce | wc -l | tr -d ' ')"
+# 39g. type change dir -> file after the subtree was copied: our old subtree
+# goes (deepest first), the file is copied
+rm -rf rs rd; mkdir -p rs/t rd/rs
+echo in > rs/t/in; echo p > rs/z_prompt; echo stale > rd/rs/z_prompt
+( sleep 1; rm -r rs/t; echo now-a-file > rs/t; echo y ) | $V -R -i -v --sort --reconcile rs rd >rco 2>rce
+chk rc-typechange-rc 0 $?
+[ -f rd/rs/t ] && [ "$(cat rd/rs/t)" = now-a-file ] && ok || bad rc-typechange-file
+grep -q '^deleting rd/rs/t/in$' rco && grep -q '^deleting rd/rs/t$' rco && ok || bad rc-typechange-deleting
+chk rc-typechange-order "deleting rd/rs/t/in deleting rd/rs/t rs/t -> rd/rs/t" \
+  "$(grep -E '^deleting|^rs/t ->' rco | tail -3 | tr '\n' ' ' | sed 's/ $//')"
+rcerr | grep -q '^vcp: reconcile pass 1: 0 new, 1 changed, 2 gone$' && ok || bad "rc-typechange-notice ($(rcerr))"
+# same, but the directory is replaced before its contents were reached:
+# rs/t/in fails with ENOTDIR, which is a deferred vanish, not an error
+rm -rf rs rd; mkdir -p rs/t rd/rs
+echo in > rs/t/in; echo p > rs/b_prompt; echo stale > rd/rs/b_prompt
+( sleep 1; rm -r rs/t; echo now-a-file > rs/t; echo y ) | $V -R -i -v --sort --reconcile rs rd >rco 2>rce
+chk rc-typechange2-rc 0 $?
+[ -f rd/rs/t ] && [ "$(cat rd/rs/t)" = now-a-file ] && ok || bad rc-typechange2-file
+rcerr | grep -q 'Not a directory' && bad "rc-typechange2-quiet ($(rcerr))" || ok
+rcerr | grep -q '^vcp: reconcile pass 1: 0 new, 1 changed, 1 gone$' && ok || bad "rc-typechange2-notice ($(rcerr))"
+# 39h. --passes=1: source still changing after the allowed pass -> warning, rc 1
+rm -rf rs rd; mkdir -p rs rd/rs
+echo p > rs/b_prompt; echo stale > rd/rs/b_prompt
+( sleep 1; echo x1 >> rs/b_prompt; echo y; sleep 1; echo x2 >> rs/b_prompt; echo y ) \
+  | $V -R -i --sort --reconcile --passes=1 rs rd >rco 2>rce
+chk rc-passes1-rc 1 $?
+rcerr | grep -q '^vcp: source still changing after 1 reconcile pass; destination may be out of sync$' \
+  && ok || bad "rc-passes1-warn ($(rcerr))"
+# 39i. --settle: fresh file held back in phase 0, copied once settled; DIR_TO_DNE
+rm -rf rs rd; mkdir -p rs/deep
+echo a > rs/a; echo b > rs/deep/b; touch -t $OLD rs/a rs/deep/b; echo f > rs/fresh
+$V -R -p -v --sort --reconcile --settle=3 rs rd >rco 2>rce & rcpid=$!
+sleep 1; rm -r rs/deep; echo n > rs/new; touch -t $OLD rs/new
+wait $rcpid; chk rc-settle-rc 0 $?
+chk rc-settle-tree "a fresh new" "$(ls rd | tr '\n' ' ' | sed 's/ $//')"
+grep -q '^vcp: waiting for 1 unsettled file$' rce && ok || bad "rc-settle-wait-notice ($(cat rce))"
+grep -q '^vcp: reconcile pass 1: 2 new, 0 changed, 2 gone$' rce && ok || bad "rc-settle-notice ($(cat rce))"
+grep -q '^deleting rd/deep/b$' rco && grep -q '^deleting rd/deep$' rco && ok || bad rc-settle-deleting
+chk rc-settle-p-dirtime "$(stat -f %m rs)" "$(stat -f %m rd)"
+# 39j. safety: pre-existing destination dir (not ours) survives; roots never removed
+rm -rf rs rd; mkdir -p rs/deep rd/rs/deep
+echo b > rs/deep/b; touch -t $OLD rs/deep/b; echo f > rs/fresh
+$V -R -v --sort --reconcile --settle=2 rs rd >rco 2>rce & rcpid=$!
+sleep 1; rm -r rs/deep; wait $rcpid; chk rc-notours-rc 0 $?
+[ -d rd/rs/deep ] && [ ! -e rd/rs/deep/b ] && ok || bad rc-notours-dir-kept
+rm -rf rd; mkdir rd; echo r1 > root1.txt; echo p > rp_prompt.txt; echo stale > rd/rp_prompt.txt
+( sleep 1; rm root1.txt; echo y ) | $V -R -i -v --sort --reconcile root1.txt rp_prompt.txt rd >rco 2>rce
+chk rc-root-rc 1 $?
+[ -f rd/root1.txt ] && ok || bad rc-root-kept
+chk rc-root-msg "vcp: root1.txt: No such file or directory" "$(rcerr | grep -v 'reconcile pass')"
+# 39k. stats are per phase: fresh bars (count total) for every pass
+rm -rf rs rd; rm -f rccap rclines; mkdir -p rs rd/rs
+echo 1 > rs/a1; echo 2 > rs/a2; echo p > rs/b_prompt; echo stale > rd/rs/b_prompt
+COLUMNS=100 script -q rccap sh -c \
+  "( sleep 1; echo n1 > rs/n1; echo n2 > rs/n2; echo y ) | $V -R -i --sort --reconcile rs rd" >/dev/null 2>&1
+tr '\r' '\n' < rccap | sed -E "s/${ESC}\[[0-9]*[A-Za-z]//g; s/^[^|a-z]*([a-z]+: +\|)/\1/" | grep '^count: |' > rclines
+grep -q '(3/3 ' rclines && ok || bad rc-bars-phase0-total3
+grep -q '(2/2 ' rclines && ok || bad rc-bars-phase1-total2
+# phase 1 bars (total 2) only after phase 0 reached 3/3
+awk '/\(3\/3 /{seen=1} /\/2 /{if(!seen)exit 1}' rclines && ok || bad rc-bars-order
+rm -f rco rce rccap rclines rcpid
+
 echo
 echo "passed=$pass failed=$fail"
 [ $fail -eq 0 ]
