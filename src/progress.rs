@@ -6,17 +6,20 @@
 //! output goes to stderr and is automatically disabled when stderr is
 //! not a tty.
 //!
-//! Single object copied: one full-width bar plus the speed line:
+//! Single object copied: one full-width bar plus speed and ETA lines:
 //!   |=============== (filename   34.01%) ===>          |
 //!   | speed: current    4.213 M/s    average    3.987 M/s          |
-//! More than one object: three labeled bars plus the speed line:
+//!   | eta:   current          1h 32m 16s    average          1h 40m 02s |
+//! More than one object: three labeled bars plus speed and ETA lines:
 //!   count: |===== ( 12/345    3.48%) =>                |
 //!   bytes: |===== ( 259.31M/2.03T   12.34%) ==>        |
 //!   file:  |===== (...current/file.c   45.00%) ====>   |
 //!   speed: | current    4.213 M/s    average    3.987 M/s        |
+//!   eta:   | current          1h 32m 16s    average          1h 40m 02s |
 //!
 //! `current` is the transfer rate over the last few seconds
-//! (SPEED_WINDOW), `average` the rate since copying started; both are
+//! (SPEED_WINDOW), `average` the rate since copying started; the ETA
+//! line shows the time remaining at each of the two rates.  All are
 //! fixed-width fields so nothing moves while the numbers change.
 //!
 //! The `(...)` status text in the middle is not part of the gauge: the
@@ -142,21 +145,96 @@ fn speed_str(bps: f64) -> String {
     format!("{:>8.3} {}/s", v, UNITS[i])
 }
 
-/// Render the speed status line, boxed like the bars and `width - 1`
-/// columns wide: `speed: | current    4.213 M/s    average    3.987 M/s |`.
-/// With an empty label (single-object mode) the word moves inside.
+/// Render the speed/ETA status block, boxed like the bars and `width - 1`
+/// columns wide, two lines:
+///   speed: | current    4.213 M/s    average    3.987 M/s               |
+///   eta:   | current          1h 32m 16s    average          1h 40m 02s |
+/// With an empty label (single-object mode) the words move inside:
+///   | speed: current    4.213 M/s    average    3.987 M/s               |
+///   | eta:   current          1h 32m 16s    average          1h 40m 02s |
 fn speed_line(label: &str, cur: f64, avg: f64, width: usize) -> String {
+    boxed_line(
+        label,
+        &format!(
+            "{} current {}    average {}",
+            if label.is_empty() { " speed:" } else { "" },
+            speed_str(cur),
+            speed_str(avg)
+        ),
+        width,
+    )
+}
+
+fn eta_line(label: &str, cur: f64, avg: f64, remaining: u64, width: usize) -> String {
+    boxed_line(
+        label,
+        &format!(
+            "{} current {}    average {}",
+            if label.is_empty() { " eta:  " } else { "" },
+            eta_str(remaining, cur),
+            eta_str(remaining, avg)
+        ),
+        width,
+    )
+}
+
+fn boxed_line(label: &str, txt: &str, width: usize) -> String {
     let inner = width.saturating_sub(label.len() + 3).max(13);
-    let txt = format!(
-        "{} current {}    average {}",
-        if label.is_empty() { " speed:" } else { "" },
-        speed_str(cur),
-        speed_str(avg)
-    );
-    let mut cells = txt.into_bytes();
+    let mut cells = txt.as_bytes().to_vec();
     cells.truncate(inner);
     cells.resize(inner, b' ');
     format!("{}|{}|", label, String::from_utf8_lossy(&cells))
+}
+
+/// Width of the ETA field: fits the longest value, `999w 6d 23h 59m 59s`.
+const ETA_W: usize = 19;
+
+/// Fixed-width time remaining for `remaining` bytes at `bps`: `1w 3d 1h
+/// 32m 16s`-style, seconds precision, weeks the largest unit, right
+/// aligned; `done` when nothing is left, `unknown` when the rate is zero
+/// (stalled / not yet measured), `>999w` when hopeless.
+fn eta_str(remaining: u64, bps: f64) -> String {
+    if remaining == 0 {
+        return format!("{:>w$}", "done", w = ETA_W);
+    }
+    if !(bps.is_finite() && bps > 0.0) {
+        return format!("{:>w$}", "unknown", w = ETA_W);
+    }
+    let secs = (remaining as f64 / bps).ceil();
+    if secs >= 1000.0 * 7.0 * 86400.0 {
+        return format!("{:>w$}", ">999w", w = ETA_W);
+    }
+    format!("{:>w$}", human_dur(secs as u64), w = ETA_W)
+}
+
+/// `1w 3d 1h 32m 16s` — leading zero units dropped, inner ones kept
+/// (`1h 00m 05s`), seconds granularity, weeks the largest unit.
+fn human_dur(mut s: u64) -> String {
+    let w = s / 604800;
+    s %= 604800;
+    let d = s / 86400;
+    s %= 86400;
+    let h = s / 3600;
+    s %= 3600;
+    let m = s / 60;
+    s %= 60;
+    let mut out = String::new();
+    let mut started = false;
+    for (v, u, width) in [(w, "w", 1), (d, "d", 1), (h, "h", 1), (m, "m", 2), (s, "s", 2)] {
+        if !started && v == 0 && u != "s" {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        if started {
+            out.push_str(&format!("{:0w$}{}", v, u, w = width));
+        } else {
+            out.push_str(&format!("{}{}", v, u));
+        }
+        started = true;
+    }
+    out
 }
 
 /// Shorten a long name to `max` chars with an ASCII "..." replacing a
@@ -360,6 +438,11 @@ impl Progress {
         (cur, avg)
     }
 
+    /// Bytes still to be transferred; the basis of the ETA.
+    fn remaining(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.done_bytes)
+    }
+
     fn draw(&mut self, force: bool) {
         if !self.enabled || !self.started {
             return;
@@ -371,6 +454,7 @@ impl Progress {
         self.last = now;
         self.record(now);
         let (cur, avg) = self.speeds(now);
+        let rem = self.remaining();
         let w = term_width();
         let tick = (self.anim0.elapsed().as_millis() / ANIM_MS) as usize;
         let name = self.cur_name.clone();
@@ -392,9 +476,11 @@ impl Progress {
             ));
             lines.push(bar("file:  ", &name, self.pct_cur(), w, tick));
             lines.push(speed_line("speed: ", cur, avg, w));
+            lines.push(eta_line("eta:   ", cur, avg, rem, w));
         } else {
             lines.push(bar("", &name, self.pct_bytes(), w, tick));
             lines.push(speed_line("", cur, avg, w));
+            lines.push(eta_line("", cur, avg, rem, w));
         }
         let mut out = String::new();
         if self.drawn > 0 {
@@ -499,8 +585,8 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::{
-        bar, bytes_info, count_info, humanize, slide_trunc, speed_line, speed_str, term_width,
-        Progress,
+        bar, bytes_info, count_info, eta_line, eta_str, human_dur, humanize, slide_trunc,
+        speed_line, speed_str, term_width, Progress, ETA_W,
     };
     use std::time::{Duration, Instant};
 
@@ -857,5 +943,141 @@ mod tests {
         let (cur, avg) = p.speeds(t2);
         assert_eq!(cur, 0.0);
         assert!((avg - 105.0 * MB / 18.0).abs() < 0.01 * MB, "avg {}", avg);
+    }
+
+    #[test]
+    fn human_dur_units() {
+        assert_eq!(human_dur(0), "0s");
+        assert_eq!(human_dur(5), "5s");
+        assert_eq!(human_dur(59), "59s");
+        assert_eq!(human_dur(60), "1m 00s");
+        assert_eq!(human_dur(61), "1m 01s");
+        assert_eq!(human_dur(3599), "59m 59s");
+        assert_eq!(human_dur(3600), "1h 00m 00s");
+        assert_eq!(human_dur(3600 + 5), "1h 00m 05s");
+        assert_eq!(human_dur(5536), "1h 32m 16s");
+        assert_eq!(human_dur(86400), "1d 0h 00m 00s");
+        assert_eq!(human_dur(86400 * 7), "1w 0d 0h 00m 00s");
+        // the requested example: 1w 3d 1h 32m 16s
+        assert_eq!(human_dur(604800 + 3 * 86400 + 3600 + 32 * 60 + 16), "1w 3d 1h 32m 16s");
+        // weeks are the largest unit: 52 weeks, not "1y"
+        assert_eq!(human_dur(52 * 604800), "52w 0d 0h 00m 00s");
+        assert_eq!(human_dur(999 * 604800 + 6 * 86400 + 23 * 3600 + 59 * 60 + 59),
+                   "999w 6d 23h 59m 59s");
+        assert_eq!("999w 6d 23h 59m 59s".len(), ETA_W);
+    }
+
+    #[test]
+    fn eta_str_fixed_width_and_cases() {
+        assert_eq!(eta_str(0, 1.0), format!("{:>19}", "done"));
+        assert_eq!(eta_str(0, 0.0), format!("{:>19}", "done"));
+        assert_eq!(eta_str(100, 0.0), format!("{:>19}", "unknown"));
+        assert_eq!(eta_str(100, f64::NAN), format!("{:>19}", "unknown"));
+        assert_eq!(eta_str(100, -1.0), format!("{:>19}", "unknown"));
+        assert_eq!(eta_str(1000, 100.0), format!("{:>19}", "10s"));
+        assert_eq!(eta_str(1001, 100.0), format!("{:>19}", "11s")); // rounds up
+        assert_eq!(eta_str(5536 * 1024, 1024.0), format!("{:>19}", "1h 32m 16s"));
+        // a byte at a snail's pace: capped
+        assert_eq!(eta_str(u64::MAX, 1.0), format!("{:>19}", ">999w"));
+        assert_eq!(eta_str(1000 * 604800, 1.0), format!("{:>19}", ">999w"));
+        assert_eq!(eta_str(1000 * 604800 - 1, 1.0), format!("{:>19}", "999w 6d 23h 59m 59s"));
+        for (rem, bps) in [(0u64, 0.0), (1, 0.0), (1, 1e9), (1 << 40, 3.5), (u64::MAX, 0.001)] {
+            assert_eq!(eta_str(rem, bps).len(), ETA_W, "rem={} bps={}", rem, bps);
+        }
+    }
+
+    #[test]
+    fn eta_line_layout_and_pinned() {
+        for width in [80, 100, 132] {
+            let l = eta_line("eta:   ", 1024.0, 512.0, 5536 * 1024, width);
+            assert_eq!(l.chars().count(), width - 1);
+            assert!(
+                l.starts_with("eta:   | current          1h 32m 16s    average          3h 04m 32s "),
+                "{:?}",
+                l
+            );
+            assert!(l.ends_with('|'));
+            let s = eta_line("", 1024.0, 512.0, 5536 * 1024, width);
+            assert_eq!(s.chars().count(), width - 1);
+            assert!(
+                s.starts_with("| eta:   current          1h 32m 16s    average          3h 04m 32s "),
+                "{:?}",
+                s
+            );
+            // the "eta:" word and "current" line up under the speed line
+            // in single mode (the wider ETA fields shift "average")
+            let sp = speed_line("", 1024.0, 512.0, width);
+            assert_eq!(s.find("eta:"), sp.find("speed:"));
+            assert_eq!(s.find("current"), sp.find("current"));
+        }
+        // words and the closing '|' never move whatever the values
+        let cases: [(f64, f64, u64); 6] = [
+            (0.0, 0.0, 0),
+            (0.0, 0.0, 10),
+            (1.0, 1.0, 1),
+            (1e9, 1e3, 1 << 40),
+            (3.5, 7e6, 1 << 50),
+            (1.0, 1.0, u64::MAX),
+        ];
+        for label in ["eta:   ", ""] {
+            let key = |l: &str| {
+                (
+                    l.find("current").unwrap(),
+                    l.find("average").unwrap(),
+                    l.rfind('|').unwrap(),
+                    l.len(),
+                )
+            };
+            let first = key(&eta_line(label, 1.0, 1.0, 1, 80));
+            for &(c, a, r) in &cases {
+                assert_eq!(key(&eta_line(label, c, a, r, 80)), first);
+            }
+        }
+    }
+
+    #[test]
+    fn eta_tracks_remaining_bytes() {
+        let mb = 1u64 << 20;
+        let t0 = Instant::now();
+        let mut p = Progress::new(1, 100 * mb);
+        p.t0 = t0;
+        p.samples.clear();
+        p.record(t0);
+        p.file_start("big.bin", 100 * mb);
+        assert_eq!(p.remaining(), 100 * mb);
+        // nothing measured yet -> unknown at both rates
+        let (cur, avg) = p.speeds(t0);
+        assert_eq!(eta_str(p.remaining(), cur), format!("{:>19}", "unknown"));
+        assert_eq!(eta_str(p.remaining(), avg), format!("{:>19}", "unknown"));
+        // 40 MB in 4 s at 10 MB/s -> 60 MB left -> 6s at either rate
+        let mut t = t0;
+        for _ in 0..40 {
+            t += Duration::from_millis(100);
+            p.add(mb);
+            p.record(t);
+        }
+        let (cur, avg) = p.speeds(t);
+        assert_eq!(p.remaining(), 60 * mb);
+        assert_eq!(eta_str(p.remaining(), avg), format!("{:>19}", "6s"));
+        assert_eq!(eta_str(p.remaining(), cur), format!("{:>19}", "6s"));
+        // slow down to 1 MB/s for 3 s: current says 57s, average blends
+        let tenth = 104_858; // 1 MB / 10, rounded UP so nothing is left over
+        for _ in 0..30 {
+            t += Duration::from_millis(100);
+            p.add(tenth);
+            p.record(t);
+        }
+        let (cur, avg) = p.speeds(t);
+        let left = 100 * mb - 40 * mb - 30 * tenth; // 57 MB - 12 B
+        assert_eq!(p.remaining(), left);
+        // 56.99999 s at ~1.000002 MB/s -> ceil -> 57s
+        assert_eq!(eta_str(p.remaining(), cur), format!("{:>19}", "57s"));
+        // avg = 43 MB / 7 s = 6.14 MB/s -> 57/6.14 = 9.28 -> 10s
+        assert_eq!(eta_str(p.remaining(), avg), format!("{:>19}", "10s"));
+        // file_end() accounts the rest of the file: remaining hits zero
+        // regardless of rate
+        p.file_end();
+        assert_eq!(p.remaining(), 0);
+        assert_eq!(eta_str(p.remaining(), cur), format!("{:>19}", "done"));
     }
 }

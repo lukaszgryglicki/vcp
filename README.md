@@ -10,28 +10,35 @@ Progress is drawn on **stderr**, only when stderr is a terminal, and never
 interferes with `-v` output, prompts or warnings (bars are cleared, the
 message is printed, bars are redrawn).
 
-Copying a single file — one full-width bar plus the speed line:
+Copying a single file — one full-width bar plus the speed and ETA lines:
 
 ```
 |=================== (bigfile.iso    34.01%) =====>                            |
 | speed: current    4.213 M/s    average    3.987 M/s                          |
+| eta:   current          1h 32m 16s    average          1h 40m 02s            |
 ```
 
 Copying multiple files/directories — three labeled bars (overall count,
-overall bytes, current file) plus the speed line:
+overall bytes, current file) plus the speed and ETA lines:
 
 ```
 count: |=========== ( 12/345     3.48%) =>                                    |
 bytes: |======== ( 259.31M/2.03T    12.34%) ==>                               |
 file:  |========== (...ath/to/current/file.c    45.00%) ====>                 |
 speed: | current    4.213 M/s    average    3.987 M/s                         |
+eta:   | current          1h 32m 16s    average          1h 40m 02s           |
 ```
 
-The speed line is always present: *current* is the transfer rate over the
-last 3 seconds, *average* the rate since copying started. Both are
-fixed-width fields (`XXXX.XXX U/s`, unit auto-scaled B/K/M/G/T), so the
-words and the `/s` never move. Only bytes actually transferred count
-(skipped or failed files do not inflate the speed).
+The speed and ETA lines are always present: *current* is the transfer rate
+over the last 3 seconds, *average* the rate since copying started, and the
+ETA line shows the time remaining at each of the two rates. Speeds are
+fixed-width fields (`XXXX.XXX U/s`, unit auto-scaled B/K/M/G/T); ETAs are
+fixed-width too, human readable with seconds precision and weeks as the
+largest unit (`1w 3d 1h 32m 16s`, `59m 07s`, `12s`), showing `unknown`
+while there is no rate yet (or the copy has stalled), `>999w` for hopeless
+cases and `done` at the end. Nothing moves while the numbers change. Only
+bytes actually transferred count (skipped or failed files do not inflate
+the speed).
 
 The `(...)` status text in the middle is **not** part of the gauge: the
 fill track is the cells left of `(` plus the cells right of `)`. Reaching
@@ -133,15 +140,18 @@ cargo build --release
   excludes the `(...)` text, arrow-head monotonicity, constant line
   width, pinned `(`/`/`/`%`/`)` positions, humanized field padding,
   `COLUMNS` override, sliding-ellipsis behavior, speed formatting and
-  layout, current-window vs. average speed math, adaptive chunk sizing.
+  layout, current-window vs. average speed math, ETA formatting
+  (`1w 3d 1h 32m 16s`, `done`/`unknown`/`>999w`), ETA line layout and
+  ETA tracking of remaining bytes, adaptive chunk sizing.
 - `sh tests/vcp-suite.sh` (FreeBSD, after `cargo build --release`) —
-  117-check compatibility suite that runs `vcp` and `/bin/cp` side by
+  130-check compatibility suite that runs `vcp` and `/bin/cp` side by
   side and compares messages, exit codes and resulting trees (mtree),
   including `RESOLVE_BENEATH` escape refusal, plus pty checks
   (`script(1)`) of the rendered bars: forced `COLUMNS` width, constant
   line length, `/` and `%` never moving mid-copy, text region never
-  overwritten by the fill, speed line present under the bars in every
-  frame with pinned fields and a non-zero final average.
+  overwritten by the fill, speed and ETA lines present under the bars in
+  every frame with pinned fields, a non-zero final average and a final
+  `done` ETA.
 
 ## Why
 

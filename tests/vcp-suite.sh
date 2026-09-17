@@ -290,7 +290,8 @@ treecmp dne-root-p-tree pc pv
 ESC=$(printf '\033')
 rm -f wcap wlines wbig.out
 COLUMNS=90 script -q wcap $V tree/sub1/sub2/big wbig.out >/dev/null 2>&1
-tr '\r' '\n' < wcap | sed -E "s/${ESC}\[[0-9]*[A-Za-z]//g" | grep '^|' > wlines
+# (script(1) may prepend a stray control char to the very first frame)
+tr '\r' '\n' < wcap | sed -E "s/${ESC}\[[0-9]*[A-Za-z]//g; s/^[^|a-z]*\|/|/" | grep '^|' > wlines
 [ -s wlines ] && ok || bad w90-frames
 awk 'length($0)!=89{exit 1}' wlines && ok || bad w90-linelen
 grep -q '100\.00%' wlines && ok || bad w90-final
@@ -299,7 +300,7 @@ cmp -s tree/sub1/sub2/big wbig.out && ok || bad w90-content
 ### 35. three-bar mode: / and % never move within count/bytes bars
 rm -rf w3dst; rm -f w3cap w3lines
 COLUMNS=100 script -q w3cap $V -R tree w3dst >/dev/null 2>&1
-tr '\r' '\n' < w3cap | sed -E "s/${ESC}\[[0-9]*[A-Za-z]//g" > w3lines
+tr '\r' '\n' < w3cap | sed -E "s/${ESC}\[[0-9]*[A-Za-z]//g; s/^[^|a-z]*([a-z]+: +\|)/\1/" > w3lines
 for lbl in count bytes; do
   grep "^$lbl: |" w3lines > w3one
   [ -s w3one ] && ok || bad "w3-$lbl-frames"
@@ -331,9 +332,17 @@ grep '^speed: |' w3lines > wsp3
 awk 'length($0)!=99{exit 1}' wsp3 && ok || bad speed3-linelen
 grep -Evq '^speed: \| current +[0-9]+\.[0-9][0-9][0-9] [BKMGT]/s    average +[0-9]+\.[0-9][0-9][0-9] [BKMGT]/s +\|$' wsp3 \
   && bad speed3-format || ok
-# every file: line is followed by a speed: line, and frames end with it
-awk '/^speed: \|/{f=0; next} /^file:  \|/{if(f) exit 1; f=1} END{if(f) exit 1}' w3lines \
-  && ok || bad speed3-under-bars
+# every file: line is followed by a speed: line, then an eta: line
+# (sequence of labeled lines must be: file: -> speed: -> eta: -> count: ...)
+grep -o '^[a-z]*: ' w3lines | awk '
+  {l=$1}
+  l=="file:"  {if(st!="bytes:") exit 1}
+  l=="speed:" {if(st!="file:") exit 1}
+  l=="eta:"   {if(st!="speed:") exit 1}
+  l=="count:" {if(st!="" && st!="eta:") exit 1}
+  l=="bytes:" {if(st!="count:") exit 1}
+  {st=l}
+  END{if(st!="eta:") exit 1}' && ok || bad speed3-under-bars
 # blank digits and units: every frame must then be identical (nothing moves)
 [ "$(sed -E 's/[0-9]/#/g; s/ [BKMGT]\/s/ #\/s/g' wsp3 | sort -u | wc -l | tr -d ' ')" = 1 ] \
   && ok || bad speed3-pinned
@@ -344,11 +353,46 @@ grep '^| speed:' wlines > wsp1
 awk 'length($0)!=89{exit 1}' wsp1 && ok || bad speed1-linelen
 grep -Evq '^\| speed: current +[0-9]+\.[0-9][0-9][0-9] [BKMGT]/s    average +[0-9]+\.[0-9][0-9][0-9] [BKMGT]/s +\|$' wsp1 \
   && bad speed1-format || ok
-awk '/^\| speed:/{f=0; next} /^\|/{if(f) exit 1; f=1} END{if(f) exit 1}' wlines \
-  && ok || bad speed1-under-bar
+# (sequence must be: bar -> speed -> eta -> bar ...; the bar line has no word)
+sed -nE 's/^\| (speed|eta):.*/\1/p; s/^\|[ =>(].*/bar/p' wlines | awk '
+  $1=="bar"   {if(st!="" && st!="eta") exit 1}
+  $1=="speed" {if(st!="bar") exit 1}
+  $1=="eta"   {if(st!="speed") exit 1}
+  {st=$1}
+  END{if(st!="eta") exit 1}' && ok || bad speed1-under-bar
 [ "$(sed -E 's/[0-9]/#/g; s/ [BKMGT]\/s/ #\/s/g' wsp1 | sort -u | wc -l | tr -d ' ')" = 1 ] \
   && ok || bad speed1-pinned
 tail -1 wsp1 | grep -q 'average    0.000 B/s' && bad speed1-final-avg || ok
+
+### 38. eta line: under speed in every frame, fixed format, pinned, ends "done"
+ETA_RE='(done|unknown|>999w|([0-9]+w )?([0-9]d )?([0-9]+h )?([0-9]+m )?[0-9]+s)'
+grep '^eta:   |' w3lines > weta3
+[ -s weta3 ] && ok || bad eta3-present
+awk 'length($0)!=99{exit 1}' weta3 && ok || bad eta3-linelen
+grep -Evq "^eta:   \| current +$ETA_RE    average +$ETA_RE +\|\$" weta3 \
+  && bad eta3-format || ok
+# blank all digits/words in the value fields: then every frame is identical
+[ "$(sed -E 's/current +[^ ].*    average/current VALUE    average/; s/average +[^ |]+( [^ |]+)* +\|$/average VALUE |/' weta3 | sort -u | wc -l | tr -d ' ')" = 1 ] \
+  && ok || bad eta3-pinned
+# "current" and "average" columns pinned across frames
+[ "$(awk '{print index($0,"current"), index($0,"average")}' weta3 | sort -u | wc -l | tr -d ' ')" = 1 ] \
+  && ok || bad eta3-words-pinned
+tail -1 weta3 | grep -q 'current                done    average                done' \
+  && ok || bad eta3-final-done
+grep '^| eta:  ' wlines > weta1
+[ -s weta1 ] && ok || bad eta1-present
+awk 'length($0)!=89{exit 1}' weta1 && ok || bad eta1-linelen
+grep -Evq "^\| eta:   current +$ETA_RE    average +$ETA_RE +\|\$" weta1 \
+  && bad eta1-format || ok
+[ "$(awk '{print index($0,"current"), index($0,"average")}' weta1 | sort -u | wc -l | tr -d ' ')" = 1 ] \
+  && ok || bad eta1-words-pinned
+tail -1 weta1 | grep -q 'current                done    average                done' \
+  && ok || bad eta1-final-done
+# eta "current" column lines up with the speed line's in both modes
+[ "$(head -1 wsp1 | awk '{print index($0,"current")}')" = "$(head -1 weta1 | awk '{print index($0,"current")}')" ] \
+  && ok || bad eta1-aligned-with-speed
+[ "$(head -1 wsp3 | awk '{print index($0,"current")}')" = "$(head -1 weta3 | awk '{print index($0,"current")}')" ] \
+  && ok || bad eta3-aligned-with-speed
 
 echo
 echo "passed=$pass failed=$fail"
