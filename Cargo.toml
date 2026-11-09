@@ -3,7 +3,7 @@ name = "vcp"
 version = "0.1.0"
 edition = "2021"
 description = "FreeBSD cp(1)-compatible file copy program with ASCII progress bars"
-license = "BSD-2-Clause"
+license = "AGPL-3.0-only"
 repository = "https://github.com/lukaszgryglicki/vcp"
 
 [dependencies]
